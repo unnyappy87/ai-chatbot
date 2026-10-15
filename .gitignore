@@ -1,5 +1,31 @@
-node_modules/
-dist/
+# 환경변수와 비밀정보
 .env
+**/.env
+**/.env.*
+!**/.env.example
+backend/token.md
+
+# Python
+venv/
 **/venv/
+.venv/
+**/.venv/
 __pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Node / Vite
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+
+# 로그
+*.log
+logs/
+
+# 편집기와 운영체제
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,151 +1,298 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
-import { API_URL } from "./api";
-import { useChat } from "./hooks/useChat";
-import Welcome from "./components/Welcome";
-import MessageItem from "./components/MessageItem";
-import Composer from "./components/Composer";
+import { useChat } from "./hooks/useChat.js";
+import { useSpeechInput, useSpeechOutput } from "./hooks/useSpeech.js";
+import { LANGS, detectLang, greetingFor } from "./lib/lang.js";
+import Composer from "./components/Composer.jsx";
+import Message from "./components/Message.jsx";
+import {
+  Logo, IconPlus, IconClock, IconSun, IconMoon, IconClose, IconTrash, IconMenu,
+} from "./components/Icons.jsx";
+
+const PERSONAS = [
+  { id: "guide", label: "포트폴리오 가이드" },
+  { id: "assistant", label: "어시스턴트" },
+  { id: "teacher", label: "선생님" },
+  { id: "coder", label: "코딩 멘토" },
+  { id: "translator", label: "번역가" },
+];
+
+const VOICE_LANGS = [
+  { code: "ko-KR", label: "KO" },
+  { code: "en-US", label: "EN" },
+  { code: "ja-JP", label: "JA" },
+  { code: "es-ES", label: "ES" },
+  { code: "zh-CN", label: "ZH" },
+];
+
+const SUGGESTIONS = {
+  guide: [
+    "LeeSuJi는 어떤 디자이너인가요?",
+    "대표 프로젝트를 소개해 주세요",
+    "사용하는 기술과 도구가 궁금해요",
+    "이 챗봇은 어떻게 만들어졌나요?",
+  ],
+  assistant: [
+    "면접에서 자기소개를 잘하는 방법 알려줘",
+    "Explain what an API is with a pizza shop analogy",
+    "東京で2泊3日の旅行プランを作って",
+    "Dame 3 ideas para un portafolio web",
+  ],
+  teacher: [
+    "CSS flexbox를 초등학생도 이해하게 설명해줘",
+    "React의 state가 뭐야?",
+    "What is a REST API in simple words?",
+  ],
+  coder: [
+    "버튼 hover 애니메이션 CSS 예제 알려줘",
+    "fetch로 API 호출하는 방법",
+    "Explain async/await with a short example",
+  ],
+  translator: [
+    "안녕하세요, 만나서 반갑습니다",
+    "Where is the nearest subway station?",
+    "ありがとうございます、とても助かりました",
+  ],
+};
+
+/* 시간대별 인사말 + 다국어 순환 */
+function Greeting() {
+  const g = useMemo(() => greetingFor(new Date().getHours()), []);
+  const [i, setI] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setI((v) => (v + 1) % g.world.length), 2600);
+    return () => clearInterval(t);
+  }, [g]);
+  return (
+    <>
+      <h1 className="title">
+        <span className="lead">{g.lead}</span> <span className="grad">{g.em}</span>
+      </h1>
+      <p className="ticker" aria-hidden>
+        <span key={i}>{g.world[i]}</span>
+      </p>
+    </>
+  );
+}
+
+/* 대화 에너지 미터 */
+function Energy({ usage }) {
+  if (!usage) return null;
+  const pct = Math.max(0, Math.min(100, Math.round((usage.remaining / usage.limit) * 100)));
+  const low = usage.remaining <= 3;
+  return (
+    <div
+      className={`energy ${low ? "low" : ""}`}
+      title="무료 AI를 아껴 쓰려고 한 시간에 보낼 수 있는 대화 수를 제한해요. 시간이 지나면 조금씩 회복돼요."
+    >
+      <span className="energy-label">에너지</span>
+      <span className="energy-bar"><i style={{ width: `${pct}%` }} /></span>
+      <b>{usage.remaining}/{usage.limit}</b>
+    </div>
+  );
+}
 
 export default function App() {
-  const { messages, loading, error, send, stop, retry, reset } = useChat();
-  const scrollRef = useRef(null);
+  const chat = useChat();
+  const [input, setInput] = useState("");
+  const [drawer, setDrawer] = useState(false);
+  const [theme, setTheme] = useState(() => localStorage.getItem("nova-theme") || "light");
+  const [voiceIdx, setVoiceIdx] = useState(() => {
+    const n = Number(localStorage.getItem("nova-voice-idx"));
+    return Number.isInteger(n) && n >= 0 && n < VOICE_LANGS.length ? n : 0;
+  });
+  const bottomRef = useRef(null);
 
-  // 🌗 다크/라이트 테마 (선택값은 브라우저에 저장)
-  const [theme, setTheme] = useState(
-    () => localStorage.getItem("theme") || "dark"
-  );
+  const voice = VOICE_LANGS[voiceIdx];
+  const speechIn = useSpeechInput({ lang: voice.code, onText: setInput });
+  const speechOut = useSpeechOutput();
+
+  const { active, usage } = chat;
+  const isEmpty = active.messages.length === 0;
+
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    localStorage.setItem("theme", theme);
+    localStorage.setItem("nova-theme", theme);
   }, [theme]);
 
-  // 🟢 서버 연결 상태 표시
-  // Render 무료 서버는 한동안 안 쓰면 잠들어서, 깨어날 때까지 5초마다 확인해요
-  const [status, setStatus] = useState("connecting");
-  const [model, setModel] = useState("Qwen3");
   useEffect(() => {
-    let alive = true;
-    let tries = 0;
+    bottomRef.current?.scrollIntoView({ behavior: chat.loading ? "auto" : "smooth" });
+  }, [active.messages, chat.loading]);
 
-    const check = async () => {
-      try {
-        const res = await fetch(`${API_URL}/api/health`);
-        if (!res.ok) throw new Error("not ok");
-        const data = await res.json();
-        if (!alive) return;
-        setStatus("online");
-        setModel(data.model?.split("/").pop() || "Qwen3");
-      } catch {
-        if (!alive) return;
-        tries += 1;
-        if (tries >= 15) {
-          setStatus("offline");
-        } else {
-          setStatus("connecting");
-          setTimeout(check, 5000);
-        }
-      }
-    };
+  const locked = !!usage && usage.remaining <= 0 && !chat.loading;
+  const lockedText =
+    usage && usage.dailyRemaining <= 0
+      ? "오늘 준비한 대화를 모두 사용했어요. 내일 다시 만나요."
+      : `에너지가 모두 소진됐어요. 약 ${Math.max(1, Math.ceil((usage?.resetIn || 60) / 60))}분 뒤에 회복돼요.`;
 
-    check();
-    return () => {
-      alive = false;
-    };
-  }, []);
+  const handleSend = () => {
+    if (speechIn.listening) speechIn.cancel();
+    const text = input.trim();
+    if (!text) return;
+    setInput("");
+    chat.send(text);
+  };
 
-  // 📜 메시지가 새로 생기면(내가 질문하면) 맨 아래로 이동
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [messages.length]);
+  const cycleVoice = () => {
+    if (speechIn.listening) speechIn.stop();
+    const next = (voiceIdx + 1) % VOICE_LANGS.length;
+    setVoiceIdx(next);
+    localStorage.setItem("nova-voice-idx", String(next));
+  };
 
-  // 📜 답변이 한 글자씩 늘어날 때: 맨 아래 근처를 보고 있을 때만 따라 내려가요
-  // (위로 올려서 읽는 중이면 방해하지 않아요)
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 180;
-    if (nearBottom) el.scrollTop = el.scrollHeight;
-  }, [messages, error]);
+  const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
 
   const statusText = {
-    online: "온라인",
-    connecting: "서버 깨우는 중…",
-    offline: "연결 안 됨",
-  }[status];
+    checking: "연결 중",
+    waking: "서버를 깨우는 중… 최대 1분",
+    online: `Nova · ${(chat.server?.model || "").split("/").pop()}`,
+    offline: "연결 안 됨 · 다시 시도",
+  }[chat.server?.state];
 
-  const lastId = messages[messages.length - 1]?.id;
+  const renderComposer = (focus) => (
+    <Composer
+      value={input}
+      onChange={setInput}
+      onSend={handleSend}
+      onStop={chat.stop}
+      loading={chat.loading}
+      persona={active.persona}
+      onPersona={chat.setPersona}
+      personas={PERSONAS}
+      length={chat.length}
+      onLength={chat.setLength}
+      speech={speechIn}
+      voice={voice}
+      onCycleVoice={cycleVoice}
+      locked={locked}
+      lockedText={lockedText}
+      focusOnMount={focus}
+    />
+  );
+
+  const suggestions = (SUGGESTIONS[active.persona] || SUGGESTIONS.assistant).slice(0, 4);
 
   return (
     <div className="app">
-      {/* 움직이는 오로라 배경 */}
-      <div className="aurora" aria-hidden="true">
-        <i className="blob b1" />
-        <i className="blob b2" />
-        <i className="blob b3" />
-      </div>
+      <div className="bg" aria-hidden><i /><i /><i /></div>
 
-      {/* 상단 헤더 */}
-      <header className="header">
-        <div className="brand">
-          <div className="logo">✦</div>
-          <div>
-            <h2>Nova</h2>
-            <p className={`status ${status}`}>
-              <span className="dot" />
-              {statusText} · {model}
-            </p>
-          </div>
-        </div>
-
-        <div className="header-actions">
-          <button
-            className="icon-btn"
-            onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-            aria-label="테마 변경"
-            title="테마 변경"
-          >
-            {theme === "dark" ? "☀️" : "🌙"}
-          </button>
-          <button className="pill-btn" onClick={reset} disabled={!messages.length}>
-            ＋ 새 대화
+      {/* ───── 왼쪽 아이콘 레일 ───── */}
+      <nav className="rail" aria-label="메인 메뉴">
+        <div className="rail-logo"><Logo /></div>
+        <button type="button" onClick={chat.newChat} title="새 대화" aria-label="새 대화"><IconPlus /></button>
+        <button type="button" onClick={() => setDrawer(true)} title="대화 기록" aria-label="대화 기록"><IconClock /></button>
+        <div className="rail-bottom">
+          <button type="button" onClick={toggleTheme} title="테마 바꾸기" aria-label="테마 바꾸기">
+            {theme === "dark" ? <IconSun /> : <IconMoon />}
           </button>
         </div>
-      </header>
+      </nav>
 
-      {/* 대화 영역 */}
-      <main className="chat-scroll" ref={scrollRef}>
-        <div className="chat-inner">
-          {messages.length === 0 ? (
-            <Welcome onPick={(t) => send(t)} />
-          ) : (
-            messages.map((m) => (
-              <MessageItem
-                key={m.id}
-                message={m}
-                streaming={loading && m.id === lastId && m.role === "assistant"}
-              />
-            ))
-          )}
-
-          {error && (
-            <div className="error-box" role="alert">
-              <span>⚠️ {error}</span>
-              <button onClick={retry}>다시 시도</button>
+      {/* ───── 대화 기록 서랍 ───── */}
+      <aside className={`drawer ${drawer ? "open" : ""}`} aria-hidden={!drawer}>
+        <div className="drawer-head">
+          <b>대화 기록</b>
+          <button type="button" onClick={() => setDrawer(false)} aria-label="닫기"><IconClose /></button>
+        </div>
+        <button
+          type="button"
+          className="pill ink wide"
+          onClick={() => { chat.newChat(); setDrawer(false); }}
+        >
+          <IconPlus width={16} height={16} /> 새 대화
+        </button>
+        <div className="drawer-list">
+          {chat.chats.map((c) => (
+            <div
+              key={c.id}
+              className={`item ${c.id === active.id ? "on" : ""}`}
+              onClick={() => { chat.openChat(c.id); setDrawer(false); }}
+            >
+              <span>{c.title}</span>
+              <button
+                type="button"
+                aria-label="대화 삭제"
+                onClick={(e) => { e.stopPropagation(); chat.deleteChat(c.id); }}
+              >
+                <IconTrash width={16} height={16} />
+              </button>
             </div>
-          )}
+          ))}
         </div>
-      </main>
+        <button type="button" className="pill soft wide" onClick={toggleTheme}>
+          {theme === "dark" ? "라이트 모드로" : "다크 모드로"}
+        </button>
+      </aside>
+      <div className={`scrim ${drawer ? "show" : ""}`} onClick={() => setDrawer(false)} />
 
-      {/* 입력창 */}
-      <footer className="footer">
-        <div className="chat-inner">
-          <Composer onSend={(t) => send(t)} onStop={stop} loading={loading} />
-          <p className="disclaimer">
-            Nova는 실수할 수 있어요. 중요한 정보는 꼭 다시 확인하세요.
-          </p>
-        </div>
-      </footer>
+      {/* ───── 메인 ───── */}
+      <main className="stage">
+        <header className="top">
+          <div className="top-left">
+            <button type="button" className="menu-btn" onClick={() => setDrawer(true)} aria-label="메뉴">
+              <IconMenu />
+            </button>
+            <button
+              type="button"
+              className={`status ${chat.server?.state}`}
+              onClick={() => chat.server?.state === "offline" && chat.checkServer()}
+            >
+              <i /><span>{statusText}</span>
+            </button>
+          </div>
+          <div className="top-right">
+            <Energy usage={usage} />
+            <button type="button" className="pill soft hide-sm" onClick={chat.exportChat} disabled={isEmpty}>
+              내보내기
+            </button>
+            <button type="button" className="pill ink" onClick={chat.newChat}>새 대화</button>
+          </div>
+        </header>
+
+        {isEmpty ? (
+          <section className="hero">
+            <Greeting />
+            <p className="sub">무엇이든 물어보세요. 어떤 언어로 말해도 같은 언어로 답해요.</p>
+            {renderComposer(false)}
+            <div className="suggest">
+              {suggestions.map((s) => (
+                <button key={s} type="button" onClick={() => chat.send(s)}>
+                  <em>{detectLang(s)?.label}</em>{s}
+                </button>
+              ))}
+            </div>
+            <p className="hint">추천 질문은 저장된 답변이면 에너지를 쓰지 않아요 ⚡</p>
+          </section>
+        ) : (
+          <>
+            <section className="scroll">
+              <div className="thread">
+                {active.messages.map((m, i) => (
+                  <Message
+                    key={m.id}
+                    message={m}
+                    isLast={i === active.messages.length - 1}
+                    canRegenerate={!chat.loading}
+                    onRegenerate={chat.regenerate}
+                    speaking={speechOut.speakingId === m.id}
+                    onSpeak={() =>
+                      speechOut.speak(m.id, m.content, (detectLang(m.content) || LANGS.ko).speech)
+                    }
+                    speechSupported={speechOut.supported}
+                  />
+                ))}
+                <div ref={bottomRef} />
+              </div>
+            </section>
+            <div className="dock">{renderComposer(true)}</div>
+          </>
+        )}
+
+        <footer className="legal">
+          <p>AI 답변은 오류가 있을 수 있습니다. 중요한 정보는 반드시 다시 확인해 주세요.</p>
+          <p>무료 AI를 아껴 쓰기 위해 한 시간에 {usage?.limit ?? 12}번까지 대화할 수 있어요.</p>
+        </footer>
+      </main>
     </div>
   );
 }

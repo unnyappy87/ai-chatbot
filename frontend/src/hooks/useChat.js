@@ -1,99 +1,240 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { streamChat } from "../api";
+import { useEffect, useRef, useState } from "react";
+import { fetchHealth, fetchUsage, streamChat } from "../lib/api.js";
 
-const STORAGE_KEY = "nova-chat-history";
+const STORAGE_KEY = "nova-v3-chats";
+const LENGTH_KEY = "nova-v3-length";
 
-// 고유 ID 만들기 (http 환경 등 randomUUID가 없을 때를 대비한 대체 코드 포함)
 const uid = () =>
-  typeof crypto !== "undefined" && crypto.randomUUID
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
 
-// 새로고침해도 대화가 남도록 브라우저(localStorage)에서 불러오기
-function loadHistory() {
+const createChat = (persona = "guide") => ({
+  id: uid(),
+  title: "새 대화",
+  persona,
+  messages: [],
+  updatedAt: Date.now(),
+});
+
+function loadChats() {
   try {
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    return Array.isArray(saved) ? saved : [];
+    const raw = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    if (Array.isArray(raw) && raw.length) {
+      return raw.map((c) => ({
+        ...c,
+        messages: (c.messages || []).map((m) => ({ ...m, streaming: false })),
+      }));
+    }
   } catch {
-    return [];
+    /* 저장된 게 없으면 새로 시작 */
   }
+  return [createChat()];
 }
 
+const toHistory = (messages) =>
+  messages
+    .filter((m) => m.content && !m.error)
+    .map(({ role, content }) => ({ role, content }));
+
 export function useChat() {
-  const [messages, setMessages] = useState(loadHistory);
+  const [chats, setChats] = useState(loadChats);
+  const [activeId, setActiveId] = useState(() => chats[0].id);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  const [usage, setUsage] = useState(null);
+  const [server, setServer] = useState({ state: "checking", model: "" });
+  const [length, setLengthState] = useState(() => {
+    const v = localStorage.getItem(LENGTH_KEY);
+    return ["short", "normal", "long"].includes(v) ? v : "normal";
+  });
+
   const abortRef = useRef(null);
+  const checkRef = useRef(0);
 
-  // 대화가 바뀔 때마다 저장
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
-  }, [messages]);
+  const active = chats.find((c) => c.id === activeId) || chats[0];
 
-  // 질문 보내기 (base: 어디까지의 대화에 이어붙일지)
-  const send = useCallback(
-    async (text, base = messages) => {
-      const content = text.trim();
-      if (!content || loading) return;
-
-      setError("");
-      const userMsg = { id: uid(), role: "user", content };
-      const botMsg = { id: uid(), role: "assistant", content: "" };
-
-      // 서버에는 최근 20개 대화만 보냅니다 (속도·사용량 절약)
-      const history = [...base, userMsg]
-        .slice(-20)
-        .map(({ role, content }) => ({ role, content }));
-
-      setMessages([...base, userMsg, botMsg]);
-      setLoading(true);
-
-      const controller = new AbortController();
-      abortRef.current = controller;
-
+  /* 서버 상태 확인 (Render 무료 서버는 잠들어 있을 수 있어요) */
+  const checkServer = async () => {
+    const myId = ++checkRef.current;
+    setServer({ state: "waking", model: "" });
+    for (let i = 0; i < 14; i++) {
+      if (myId !== checkRef.current) return;
       try {
-        await streamChat(history, {
-          signal: controller.signal,
-          onToken: (token) =>
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === botMsg.id ? { ...m, content: m.content + token } : m
-              )
-            ),
-        });
-      } catch (e) {
-        // 사용자가 직접 중지한 경우(AbortError)는 에러로 보여주지 않아요
-        if (e.name !== "AbortError") {
-          setError(e.message || "알 수 없는 오류가 발생했어요.");
-        }
-      } finally {
-        // 내용이 하나도 없는 빈 답변 말풍선은 제거
-        setMessages((prev) =>
-          prev.filter((m) => !(m.id === botMsg.id && m.content === ""))
-        );
-        setLoading(false);
-        abortRef.current = null;
+        const d = await fetchHealth();
+        if (myId !== checkRef.current) return;
+        setServer({ state: "online", model: d.model || "" });
+        fetchUsage().then(setUsage).catch(() => {});
+        return;
+      } catch {
+        /* 아직 안 깨어남 */
       }
-    },
-    [messages, loading]
-  );
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+    if (myId === checkRef.current) setServer({ state: "offline", model: "" });
+  };
 
-  // 답변 생성 중지
-  const stop = useCallback(() => abortRef.current?.abort(), []);
-
-  // 마지막 질문 다시 보내기
-  const retry = useCallback(() => {
-    const idx = messages.map((m) => m.role).lastIndexOf("user");
-    if (idx === -1) return;
-    send(messages[idx].content, messages.slice(0, idx));
-  }, [messages, send]);
-
-  // 새 대화 시작
-  const reset = useCallback(() => {
-    abortRef.current?.abort();
-    setMessages([]);
-    setError("");
+  useEffect(() => {
+    checkServer();
+    return () => {
+      checkRef.current++;
+    };
   }, []);
 
-  return { messages, loading, error, send, stop, retry, reset };
+  /* 대화 저장 (답변 생성 중에는 쉬었다가 끝나면 저장) */
+  useEffect(() => {
+    if (loading) return;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(chats));
+    } catch {
+      /* 용량 초과는 무시 */
+    }
+  }, [chats, loading]);
+
+  const updateChat = (chatId, fn) =>
+    setChats((prev) => prev.map((c) => (c.id === chatId ? fn(c) : c)));
+
+  const patchMessage = (chatId, msgId, fn) =>
+    updateChat(chatId, (c) => ({
+      ...c,
+      messages: c.messages.map((m) => (m.id === msgId ? fn(m) : m)),
+    }));
+
+  /* AI 답변 생성 (전송 / 다시 생성이 같이 사용) */
+  const run = async ({ chatId, botId, persona, history, regenerate }) => {
+    setLoading(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      await streamChat({
+        messages: history,
+        persona,
+        length,
+        regenerate,
+        signal: controller.signal,
+        onToken: (t) =>
+          patchMessage(chatId, botId, (m) => ({ ...m, content: m.content + t })),
+        onMeta: (meta) => {
+          if (meta.cached) patchMessage(chatId, botId, (m) => ({ ...m, cached: true }));
+          if (meta.usage) setUsage(meta.usage);
+        },
+      });
+      patchMessage(chatId, botId, (m) => ({ ...m, streaming: false }));
+    } catch (err) {
+      if (err.name === "AbortError") {
+        patchMessage(chatId, botId, (m) => ({ ...m, streaming: false, stopped: true }));
+      } else {
+        if (err.usage) setUsage(err.usage);
+        patchMessage(chatId, botId, (m) => ({
+          ...m,
+          streaming: false,
+          error: true,
+          errorCode: err.code || "network",
+          content: err.message || "알 수 없는 오류가 생겼어요.",
+        }));
+      }
+    } finally {
+      setLoading(false);
+      abortRef.current = null;
+      fetchUsage().then(setUsage).catch(() => {});
+    }
+  };
+
+  const send = (text) => {
+    const content = (text || "").trim();
+    if (!content || loading) return;
+
+    const chat = active;
+    const userMsg = { id: uid(), role: "user", content };
+    const botMsg = { id: uid(), role: "assistant", content: "", streaming: true };
+    const history = toHistory([...chat.messages, userMsg]);
+
+    updateChat(chat.id, (c) => ({
+      ...c,
+      title: c.messages.length === 0 ? content.slice(0, 24) : c.title,
+      updatedAt: Date.now(),
+      messages: [...c.messages, userMsg, botMsg],
+    }));
+
+    run({ chatId: chat.id, botId: botMsg.id, persona: chat.persona, history, regenerate: false });
+  };
+
+  const regenerate = () => {
+    if (loading) return;
+    const msgs = active.messages;
+    const last = msgs[msgs.length - 1];
+    if (!last || last.role !== "assistant" || msgs.length < 2) return;
+
+    patchMessage(active.id, last.id, (m) => ({
+      ...m,
+      content: "",
+      streaming: true,
+      error: false,
+      errorCode: null,
+      stopped: false,
+      cached: false,
+    }));
+
+    run({
+      chatId: active.id,
+      botId: last.id,
+      persona: active.persona,
+      history: toHistory(msgs.slice(0, -1)),
+      regenerate: true,
+    });
+  };
+
+  const stop = () => abortRef.current?.abort();
+
+  const newChat = () => {
+    if (loading) return;
+    if (active.messages.length === 0) return;
+    const c = createChat(active.persona);
+    setChats((prev) => [c, ...prev]);
+    setActiveId(c.id);
+  };
+
+  const openChat = (id) => {
+    if (!loading) setActiveId(id);
+  };
+
+  const deleteChat = (id) => {
+    if (loading) return;
+    const rest = chats.filter((c) => c.id !== id);
+    if (rest.length === 0) {
+      const c = createChat();
+      setChats([c]);
+      setActiveId(c.id);
+    } else {
+      setChats(rest);
+      if (id === activeId) setActiveId(rest[0].id);
+    }
+  };
+
+  const setPersona = (persona) => updateChat(active.id, (c) => ({ ...c, persona }));
+
+  const setLength = (v) => {
+    setLengthState(v);
+    localStorage.setItem(LENGTH_KEY, v);
+  };
+
+  /* 대화를 .md 파일로 저장 */
+  const exportChat = () => {
+    const lines = [`# ${active.title}`, ""];
+    active.messages.forEach((m) => {
+      if (!m.content) return;
+      lines.push(m.role === "user" ? "## 나" : "## Nova", "", m.content, "");
+    });
+    const blob = new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `nova-${new Date().toISOString().slice(0, 10)}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return {
+    chats, active, loading, usage, server, length,
+    send, regenerate, stop, newChat, openChat, deleteChat,
+    setPersona, setLength, exportChat, checkServer,
+  };
 }

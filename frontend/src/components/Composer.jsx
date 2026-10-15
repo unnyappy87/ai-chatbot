@@ -1,73 +1,121 @@
-import { useEffect, useRef, useState } from "react";
-const MAX = 4000; // 백엔드의 글자 수 제한과 같아야 해요
-export default function Composer ({ onSend, onStop, loading}) {
-    const [text, setText] = useState("");
-    const ref = useRef(null);
-    // 글이 길어지면 입력창 높이가 자동으로 늘어납니다 (최대 200px)
-     useEffect(() => {
+import { useEffect, useRef } from "react";
+import { IconMic, IconArrowUp, IconStop } from "./Icons.jsx";
+import Dropdown from "./Dropdown.jsx";
+import { detectLang } from "../lib/lang.js";
+
+const MAX = 1000;
+const LENGTHS = [
+  { id: "short", label: "짧게" },
+  { id: "normal", label: "보통" },
+  { id: "long", label: "자세히" },
+];
+
+export default function Composer({
+  value, onChange, onSend, onStop, loading,
+  persona, onPersona, personas,
+  length, onLength,
+  speech, voice, onCycleVoice,
+  locked, lockedText, focusOnMount,
+}) {
+  const ref = useRef(null);
+  const detected = detectLang(value);
+
+  useEffect(() => {
+    if (focusOnMount) ref.current?.focus();
+  }, [focusOnMount]);
+
+  useEffect(() => {
     const el = ref.current;
     if (!el) return;
     el.style.height = "auto";
-    el.style.height = Math.min(el.scrollHeight, 200) + "px";
-  }, [text]);
-
-  const submit = () => {
-    if (!text.trim() || loading) return;
-    onSend(text);
-    setText("");
-  };
+    el.style.height = Math.min(el.scrollHeight, 180) + "px";
+  }, [value]);
 
   const onKeyDown = (e) => {
-    // 한글 입력 중(글자 조합 중)의 Enter는 무시해야
-    // 마지막 글자가 중복 전송되는 버그가 생기지 않아요
+    // 한글 조합 중 Enter는 무시 (두 번 전송 방지)
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
-      submit();
+      if (!loading && value.trim() && !locked) onSend();
     }
   };
 
   return (
-    <div className="composer">
-      <textarea
-        ref={ref}
-        rows={1}
-        value={text}
-        maxLength={MAX}
-        placeholder="메시지를 입력하세요…  (Enter 전송 · Shift+Enter 줄바꿈)"
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={onKeyDown}
-      />
+    <div>
+      {speech.error && <p className="voice-error" role="alert">{speech.error}</p>}
 
-      {text.length > MAX * 0.8 && (
-        <span className="counter">
-          {text.length}/{MAX}
-        </span>
-      )}
+      <div className={`composer ${speech.listening ? "listening" : ""}`}>
+        <textarea
+          ref={ref}
+          rows={1}
+          value={value}
+          maxLength={MAX}
+          disabled={locked}
+          readOnly={speech.listening}
+          placeholder={locked ? lockedText : speech.listening ? "말씀하세요…" : "무엇이든 물어보세요!"}
+          onChange={(e) => onChange(e.target.value)}
+          onKeyDown={onKeyDown}
+        />
 
-      {loading ? (
-        <button className="send stop" onClick={onStop} aria-label="생성 중지">
-          <svg viewBox="0 0 24 24" width="18" height="18">
-            <rect x="6" y="6" width="12" height="12" rx="2.5" fill="currentColor" />
-          </svg>
-        </button>
-      ) : (
-        <button
-          className="send"
-          onClick={submit}
-          disabled={!text.trim()}
-          aria-label="전송"
-        >
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="none">
-            <path
-              d="M12 19V5M5 12l7-7 7 7"
-              stroke="currentColor"
-              strokeWidth="2.4"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+        <div className="composer-row">
+          <div className="tools">
+            <button
+              type="button"
+              className={`ibtn ${speech.listening ? "on" : ""}`}
+              onClick={() => (speech.listening ? speech.stop() : speech.start(value))}
+              disabled={!speech.supported || loading || locked}
+              aria-pressed={speech.listening}
+              aria-label={speech.listening ? "음성 입력 종료" : "음성 입력 시작"}
+              title={speech.supported ? "음성으로 입력" : "이 브라우저는 음성 입력을 지원하지 않아요 (Chrome · Edge · Safari)"}
+            >
+              <IconMic />
+            </button>
+
+            {speech.supported && (
+              <button type="button" className="chip" onClick={onCycleVoice} title="음성 인식 언어 바꾸기">
+                {voice.label}
+              </button>
+            )}
+
+            {speech.listening ? (
+              <span className="wave" aria-hidden><i /><i /><i /><i /><i /></span>
+            ) : (
+              detected && <span className="detect" title="감지된 입력 언어">{detected.label} 감지</span>
+            )}
+            {value.length > 800 && <span className="count">{value.length}/{MAX}</span>}
+          </div>
+
+          <div className="opts">
+            <Dropdown
+              label="대화 모드"
+              value={persona}
+              onChange={onPersona}
+              options={personas.map((p) => ({ value: p.id, label: p.label }))}
             />
-          </svg>
-        </button>
-      )}
+            <Dropdown
+              label="응답 길이"
+              value={length}
+              onChange={onLength}
+              options={LENGTHS.map((l) => ({ value: l.id, label: l.label }))}
+            />
+
+            {loading ? (
+              <button type="button" className="send stop" onClick={onStop} aria-label="생성 중지">
+                <IconStop />
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="send"
+                onClick={onSend}
+                disabled={!value.trim() || locked}
+                aria-label="전송"
+              >
+                <IconArrowUp />
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
